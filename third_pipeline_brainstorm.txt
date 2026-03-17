@@ -1,0 +1,386 @@
+================================================================================
+THIRD AMPLICON PIPELINE — DESIGN BRAINSTORM
+================================================================================
+
+This document explores how to differentiate a third pipeline from:
+  1. modified_CONCOMPRA.sh  → reference-free k-mer clustering + lamassemble
+  2. Emu                    → alignment-based EM abundance estimation
+
+
+THE LANDSCAPE GAP
+-----------------
+
+  Pipeline             Core Innovation               Blind Spot
+  ------------------   ---------------------------   ----------------------------
+  Emu                  EM refines abundances          Can't detect novel species
+  modified_CONCOMPRA   K-mer clustering finds         Abundance = simple read
+                       unknown taxa reference-free    count, no probabilistic model
+  Original Workflow    MMseqs2 ASV-like derep +       Identity-based clustering
+                       multi-classifier taxonomy      doesn't model ONT errors
+  NanoCLUST            Heavy Canu+Medaka consensus    Overkill; no chimera detection
+
+  >>> KEY GAP: No tool currently combines:
+      (a) Probabilistic abundance estimation (Emu's strength)
+      (b) Novel species discovery (CONCOMPRA's strength)
+      (c) ONT error-profile-aware denoising (DADA2 does this for Illumina only)
+
+
+================================================================================
+FIVE INNOVATION AREAS
+================================================================================
+
+
+INNOVATION #1 — ONT Error-Model-Aware Denoising (DADA2 for Long Reads)
+-----------------------------------------------------------------------
+
+Problem:  DADA2's core insight is that Illumina errors are predictable, so
+          you can distinguish true variants from errors at single-nucleotide
+          resolution. Nobody has done this for ONT because ONT's indel-
+          dominated error profile is harder to model.
+
+Innovation: Use LAST's sample-specific error model (which we already train
+            in modified_CONCOMPRA.sh) to build an error distance matrix
+            between sequences. Two sequences within the error model's
+            predicted distance are collapsed; those beyond it are kept
+            separate.
+
+  How it works:
+
+    Input:  all unique reads + LAST-trained error model
+
+    Step 1: Exact dereplication (like original workflow)
+    Step 2: For each pair of unique sequences, compute:
+              P(seq_B | seq_A, error_model)
+            If P > threshold → collapse B into A
+    Step 3: Output: error-model-denoised ASVs
+
+  This is genuinely novel — it's DADA2's philosophy applied to ONT with a
+  probabilistic error model rather than a transition matrix. The LAST error
+  model captures substitution rates, indel rates, and their context
+  dependence specifically for the sequencing run.
+
+  Feasibility: We already train the LAST error model. The main challenge is
+  computing pairwise alignment likelihoods efficiently. For N unique
+  sequences, naive all-vs-all is O(N²) — but we can use minimap2 to pre-
+  filter candidates (only sequences within ~5% edit distance need likelihood
+  computation), making it tractable.
+
+
+INNOVATION #2 — Align-First, Cluster-Remainder (Hybrid Architecture)
+----------------------------------------------------------------------
+
+Problem:  Reference-based tools miss novel species. Reference-free tools
+          can't leverage known taxonomy. Nobody does both in an integrated
+          way.
+
+Innovation: A two-phase architecture:
+
+  PHASE 1 — REFERENCE-ANCHORED (for known species)
+
+    All reads → minimap2 → reference DB
+    High-confidence alignments (MAPQ >= 30, identity >= 95%) → "explained"
+    Probabilistic EM abundance estimation (Emu-like) on explained reads
+
+  PHASE 2 — REFERENCE-FREE DISCOVERY (for novel species)
+
+    Unexplained reads (unmapped + low-confidence) → k-mer/UMAP/OPTICS
+    Per-cluster consensus (lamassemble) → novel OTU candidates
+    Re-map ALL reads to consensus → abundance quantification
+
+  PHASE 3 — UNIFIED OUTPUT
+
+    Merge Phase 1 known-species abundances + Phase 2 novel-species abundances
+    Flag novel species: "97% identity to nearest known taxon"
+    Output: combined abundance table + novelty annotations
+
+  This gives you Emu-quality results for known species AND CONCOMPRA-quality
+  discovery for novel species, in one pipeline.
+
+  The "novelty score": For each Phase 2 OTU, compute its best alignment
+  identity to the reference database. This becomes a continuous novelty
+  metric: 99% identity = likely a known species variant, 90% = possibly
+  novel genus, 80% = novel family.
+
+
+INNOVATION #3 — Graph-Based Community Detection (vs UMAP + Density Clustering)
+-------------------------------------------------------------------------------
+
+Problem:  Both NanoCLUST and CONCOMPRA use UMAP (lossy dimensionality
+          reduction) → density-based clustering (requires fragile parameter
+          tuning). UMAP can distort distances.
+
+Innovation: Skip UMAP entirely. Build a sequence similarity graph directly
+            from minimap2 all-vs-all alignments, then use Leiden community
+            detection (the algorithm behind single-cell RNA-seq clustering
+            in Seurat/Scanpy).
+
+  Step 1: minimap2 all-vs-all on denoised reads → PAF
+  Step 2: Build graph: nodes = reads, edges = alignments with identity > 95%
+          Edge weight = alignment identity × aligned fraction
+  Step 3: Leiden algorithm → communities = OTUs
+          Resolution parameter controls granularity (species vs genus level)
+
+  Advantages over UMAP+OPTICS:
+
+    UMAP+OPTICS                           Graph+Leiden
+    ------------------------------------- ------------------------------------
+    Lossy projection (512D → 2D)          No dimension reduction
+    Fragile min_samples parameter         Resolution parameter is intuitive
+    Can merge distant clusters in 2D      Respects actual sequence distances
+    Can't explain why clusters split      Graph structure is interpretable
+
+  Scalability note: All-vs-all minimap2 on 100K reads is feasible (~15 min)
+  but the graph could be huge. Solution: set a minimum identity threshold
+  (e.g., 90%) to create a sparse graph. This is exactly what tools like
+  vConTACT2 (viral genomics) do.
+
+
+INNOVATION #4 — Multi-Tool Consensus Taxonomy with Confidence Scores
+----------------------------------------------------------------------
+
+Problem:  Every tool uses a different taxonomy approach. The original
+          workflow runs three classifiers independently but doesn't merge
+          them intelligently. Nobody provides a calibrated confidence score.
+
+Innovation: Run multiple classifiers and compute a weighted consensus with
+            a classification confidence score:
+
+  Each OTU gets classified by:
+    A. minimap2 + SILVA   →  taxon_A  + identity_A
+    B. Kraken2            →  taxon_B  + confidence_B
+    C. MMseqs2 LCA        →  taxon_C  + evalue_C
+    D. (optional) BLAST   →  taxon_D  + evalue_D
+
+  Consensus logic at each taxonomic rank (species → genus → ... → phylum):
+    - If >= 3 tools agree at species level → "HIGH confidence"
+    - If 2 agree → "MODERATE confidence" (report both if different)
+    - If 1 or 0 agree → escalate to genus level, repeat
+    - If no agreement at any level → "UNCLASSIFIED (novel?)"
+
+  Example output:
+
+    OTU_1  Bacillus subtilis     confidence: HIGH      3/3 agree  99.2% id
+    OTU_2  Bacillus sp.          confidence: MODERATE   genus only
+    OTU_3  Firmicutes            confidence: LOW        phylum only
+    OTU_4  NOVEL                 confidence: N/A        no classifier agrees
+
+  This is like clinical diagnostics — multiple tests, converging evidence —
+  but nobody has implemented it systematically for amplicon pipelines.
+
+
+INNOVATION #5 — Per-Read Taxonomic Purity Check
+-------------------------------------------------
+
+Problem:  All clustering-based pipelines assign taxonomy to the consensus or
+          representative sequence. But if a cluster contains a mixture of
+          closely related species (under-resolution), the representative's
+          taxonomy may be misleading.
+
+Innovation: After clustering, classify a subsample of individual reads
+            within each OTU and compute a purity score:
+
+  For each OTU with N reads:
+    Subsample min(100, N) reads
+    Classify each read independently (Kraken2, fast)
+    Compute:
+      - Dominant taxon: the most common classification
+      - Purity: fraction of reads agreeing with dominant taxon
+      - Minority taxa: other taxa present in the cluster
+
+  Example output:
+
+    OTU_1  Purity: 0.98  (98% B. subtilis, 2% B. amyloliquefaciens)
+    OTU_2  Purity: 0.72  (72% S. mutans, 28% S. sobrinus) ← MIXED CLUSTER!
+    OTU_3  Purity: 0.45  ← LIKELY CHIMERIC OR UNDER-RESOLVED
+
+  Mixed clusters (purity < 0.80) trigger automatic re-clustering at higher
+  resolution (lower min_samples or tighter identity threshold), only for
+  that specific OTU.
+
+
+================================================================================
+RECOMMENDED ARCHITECTURE — Combining Innovations #2, #4, and #5
+  with configurable consensus refinement (see CORRECTION MODES below)
+================================================================================
+
+
+CORRECTION MODES (configurable via CORRECTION_MODE variable)
+-------------------------------------------------------------
+
+  The pipeline supports three modes for refining consensus sequences after
+  lamassemble. The user selects one via a single variable:
+
+    CORRECTION_MODE="medaka"    # Mode 1 — Medaka polishing only (recommended)
+    CORRECTION_MODE="denoise"   # Mode 2 — LAST error-model denoising only
+    CORRECTION_MODE="both"      # Mode 3 — Error-model denoising + Medaka polish
+
+  Mode 1: MEDAKA POLISHING ONLY  (default, recommended for modern chemistry)
+  ---------------------------------------------------------------------------
+  Best for: R10.4.1 + V14 + SUP basecalling (raw Q20+)
+
+    lamassemble consensus
+         │
+         ▼
+    Medaka polish (one pass, model auto-detected or user-specified)
+         │
+         ▼
+    Final polished consensus (Q50+ accuracy)
+
+  Rationale: With modern ONT chemistry, raw accuracy is already ~Q20.
+  lamassemble builds a Q30-Q40 consensus. One Medaka pass pushes this to
+  Q50+ territory. Simple, fast (~30s per consensus), well-maintained.
+
+  Configuration:
+    MEDAKA_MODEL="${MEDAKA_MODEL:-r1041_e82_400bps_sup_v5.0.0}"
+
+  IMPORTANT: Unlike NanoCLUST (which hardcodes r941_min_high_g303), the
+  model parameter is always configurable. Users on older chemistry set
+  their appropriate model.
+
+
+  Mode 2: ERROR-MODEL DENOISING ONLY  (for experimental/legacy use)
+  ------------------------------------------------------------------
+  Best for: R9.4.1, older basecallers, or when Medaka is unavailable
+
+    MMseqs2 exact dereplication (100% identity)
+         │
+         ▼
+    LAST error model training (sample-specific)
+         │
+         ▼
+    Pairwise error-likelihood collapsing:
+      For each pair of unique sequences, compute:
+        P(seq_B | seq_A, error_model)
+      If P > threshold → collapse B into A (B is an error variant of A)
+         │
+         ▼
+    lamassemble consensus (from denoised read set)
+         │
+         ▼
+    Final consensus (bypasses Medaka entirely)
+
+  Rationale: This is the DADA2-for-ONT concept. Useful when raw accuracy
+  is low (Q7-Q12) and errors could create false ASVs. The LAST error
+  model captures run-specific substitution + indel rates, so collapsing
+  is adaptive rather than relying on a fixed identity threshold.
+
+  Note: The pairwise step is O(N²) in theory but tractable in practice
+  because minimap2 pre-filters candidate pairs (only sequences within
+  ~5% edit distance are compared). Still slower than Medaka.
+
+
+  Mode 3: BOTH COMBINED  (maximum accuracy, slower)
+  ---------------------------------------------------
+  Best for: Critical studies, mock community validation, low-input samples
+
+    MMseqs2 exact dereplication
+         │
+         ▼
+    LAST error-model denoising (collapse error variants)
+         │
+         ▼
+    lamassemble consensus (from denoised reads)
+         │
+         ▼
+    Medaka polish (on top of the consensus)
+         │
+         ▼
+    Final polished consensus (maximum accuracy)
+
+  Rationale: Belt-and-suspenders approach. Error-model denoising ensures
+  the input reads to lamassemble are clean (no error-inflated diversity),
+  and Medaka ensures the final consensus is as accurate as possible. Use
+  this mode for validation against mock communities to establish whether
+  Mode 1 alone is sufficient for your chemistry/basecaller combination.
+
+
+  Summary of modes:
+
+    Mode       Speed     Accuracy    Dependencies      Best for
+    --------   -------   ---------   ---------------   -------------------------
+    medaka     Fast      Very high   medaka            R10.4.1/V14/SUP (default)
+    denoise    Moderate  High        LAST only         R9.4.1 or no-Medaka setups
+    both       Slow      Highest     medaka + LAST     Validation, critical work
+
+
+FULL PIPELINE ARCHITECTURE
+---------------------------
+
+    Raw ONT Reads
+        │
+        ▼
+    Chopper QC (absolute quality/length thresholds)
+        │
+        ▼
+    Cutadapt Primer Trimming (LAST-calibrated error rate)
+        │
+        ▼
+    LAST Error Model Training (sample-specific)
+        │
+        ├──────────────────────────────┐
+        ▼                              ▼
+    Phase 1: REFERENCE-ANCHORED    [if denoise or both]
+    minimap2 → SILVA               Error-Model Denoising
+    EM abundance estimation        MMseqs2 derep → pairwise
+    (explained reads)              LAST-likelihood collapsing
+        │                              │
+        ├── Explained → abundances     │
+        ├── Unexplained ──┐            │
+        │                 ▼            ▼
+        │        Phase 2: NOVEL SPECIES DISCOVERY
+        │        k=5 UMAP + OPTICS (on unexplained reads)
+        │        lamassemble consensus
+        │                 │
+        │                 ▼
+        │        [if medaka or both]
+        │        Medaka polish (configurable model)
+        │                 │
+        │                 ▼
+        │        Chimera filtering (vsearch, 2-layer)
+        │                 │
+        ▼                 ▼
+    Phase 3: UNIFIED OUTPUT
+    Per-OTU purity check (Kraken2 on read subsamples)
+    Multi-tool consensus taxonomy (minimap2 + Kraken2 + MMseqs2)
+    Combined abundance table + novelty scores + confidence levels
+
+
+What makes this genuinely different from everything else:
+
+    Innovation                                Who does this?    This pipeline
+    ----------------------------------------  ---------------   ------------
+    Configurable consensus refinement         Nobody            YES (3 modes)
+    Align-first + cluster-remainder           Nobody            YES
+    Per-classifier confidence scores          Nobody            YES
+    Novelty scoring (% id to nearest known)   Nobody            YES
+    Per-OTU taxonomic purity checking         Nobody            YES
+
+
+================================================================================
+DECISION POINTS (for you to consider)
+================================================================================
+
+1. WHICH INNOVATIONS TO INCLUDE IN V1?
+   Recommendation: All of #2 (Align-first/Cluster-remainder), #4 (Multi-
+   tool consensus), and #5 (Purity check) are ready to implement. The
+   three-mode correction is designed so Mode 1 (Medaka) works out of
+   the box and Mode 2/3 are opt-in.
+
+2. GRAPH-BASED vs UMAP+OPTICS FOR PHASE 2?
+   Leiden community detection (#3) is algorithmically cleaner but adds
+   leidenalg and igraph as dependencies. UMAP+OPTICS is already proven
+   and we have the code from modified_CONCOMPRA.sh.
+   Recommendation: keep OPTICS for now, graph-based as a future upgrade.
+
+3. DEFAULT CORRECTION MODE?
+   Recommendation: CORRECTION_MODE="medaka" as default. Users on older
+   chemistry or wanting maximum rigor can switch to "denoise" or "both".
+
+4. PIPELINE NAME?
+   Some ideas:
+   - AMPLICON-3 (Align + Model-aware + PLacement + Innovation in Consensus
+     ONT pipeline, version 3)
+   - OMNIBUS (ONT Microbiome Novel-species Identification with Bayesian
+     Unified Scoring)
+   - HARMONIX (Hybrid Amplicon Reference-anchored + MOdel-aware
+     Novel-species Identification eXtraction)
