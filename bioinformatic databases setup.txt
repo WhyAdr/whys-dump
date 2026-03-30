@@ -1,0 +1,158 @@
+# ==============================================================================
+# GTDB-Tk Database Download Workflow
+# ==============================================================================
+
+# Bypass the download-db.sh script and do the download manually by installing aria2c
+conda install -c conda-forge aria2 -y
+
+# Move into the target directory
+mkdir -p /data/databases/gtdbtk_db
+cd /data/databases/gtdbtk_db
+
+# Execute the highly optimized aria2c command for multi-stream connection; route to the nearest mirror in Australia instead of Denmark
+aria2c \
+  --max-connection-per-server=16 \
+  --split=16 \
+  --min-split-size=1M \
+  --continue=true \	
+  --summary-interval=60 \
+  "https://data.ace.uq.edu.au/public/gtdb/data/releases/release226/226.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r226_data.tar.gz"
+
+# Alternative mirror - test this one too
+aria2c \
+  --max-connection-per-server=16 \
+  --split=16 \
+  --min-split-size=1M \
+  --continue=true \
+  --summary-interval=60 \
+  "https://data.gtdb.ecogenomic.org/releases/release226/226.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r226_data.tar.gz"
+
+# Inspect without extracting — list only the top-level entries to justify whether to strip components or not
+tar -tzf gtdbtk_r226_data.tar.gz | head -20
+
+# Verify against the checksum published on the GTDB release page
+md5sum gtdbtk_r226_data.tar.gz
+
+# Manual tarball extraction — consider using pigz for faster decompression if available
+tar -xvzf gtdbtk_r226_data.tar.gz -C /data/databases/gtdbtk_db/ --strip-components=1
+
+# Or with pigz (much faster on multi-core machines):
+pigz -dc gtdbtk_r226_data.tar.gz | tar -xvf - -C /data/databases/gtdbtk_db/ --strip-components=1
+
+# If we need resuming instead of starting over with wget
+wget -c https://data.ace.uq.edu.au/public/gtdb/data/releases/release226/226.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r226_data.tar.gz
+
+# Or with aria2c
+aria2c \
+  --continue=true \
+  --max-connection-per-server=16 \
+  --split=16 \
+  --min-split-size=1M \
+  --summary-interval=60 \
+  "https://data.ace.uq.edu.au/public/gtdb/data/releases/release226/226.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r226_data.tar.gz"
+
+# Tell GTDB-Tk where to look
+echo 'export GTDBTK_DATA_PATH="/data/databases/gtdbtk_db"' >> ~/.bashrc
+source ~/.bashrc
+
+# ==============================================================================
+# Bakta Database Download Workflow
+# ==============================================================================
+
+# Move into the target directory
+mkdir -p /data/databases/bakta_db
+cd /data/databases/bakta_db
+
+# This will download the Full version of the Bakta database (recommended). Just like before, if the download drops, we can run this exact same command again to resume (--continue=true).
+aria2c \
+  --continue=true \
+  --max-connection-per-server=4 \
+  --split=4 \
+  --min-split-size=100M \
+  --summary-interval=30 \
+  --user-agent="Mozilla/5.0 (compatible; Wget/1.21.2)" \
+  --header="Accept: */*" \
+  -o bakta_db.tar.xz \
+  "https://zenodo.org/records/14916843/files/db.tar.xz?download=1"
+
+# After aria2c completes, verify before extracting:
+md5sum -c <(echo "4c1115e40abfa2b464ae5dd988bdd88e  bakta_db.tar.xz")
+
+# Inspect tarball structure before committing to extraction, and to justify whether to strip components or not
+tar -tJf bakta_db.tar.xz | head -20
+
+# Decompress and extract the Bakta database
+# Option A: using tar's --use-compress-program (cleaner, avoids pipes)
+tar --use-compress-program="xz -T 128" \
+    --no-auto-compress \
+    -xf bakta_db.tar.xz \
+    -C /data/databases/bakta_db/ \
+    --strip-components=1 \
+    --checkpoint=5000 \
+    --checkpoint-action=echo="%T"
+
+# Option B: using a pipe
+# NOTE: Do NOT use pixz here — pixz ignores -c and decompresses in-place,
+#       destroying the .xz file and sending nothing to tar's stdin.
+#       Use xz -dc (which properly supports stdout) with -T for parallelism.
+xz -dc -T 128 bakta_db.tar.xz | tar -xf - -C /data/databases/bakta_db/ --strip-components=1 --checkpoint=5000 --checkpoint-action=echo="%T"
+
+# Updating the AMRFinderPlus database
+amrfinder_update --force_update --database /data/databases/bakta_db/amrfinderplus-db/
+
+# Set permissions for multi-user/shared HPC access (matches bakta_db built-in behavior)
+find /data/databases/bakta_db -type d -exec chmod 775 {} +
+find /data/databases/bakta_db -type f -exec chmod 664 {} +
+
+# Tell Bakta where the database is
+echo 'export BAKTA_DB="/data/databases/bakta_db"' >> ~/.bashrc
+source ~/.bashrc
+
+# Quick smoke test with a dummy 1-sequence FASTA to get the check().py running as final validation
+echo -e ">test\nATCGATCG" > /tmp/test.fasta
+bakta --db /data/databases/bakta_db /tmp/test.fasta --skip-cds --skip-trna --skip-tmrna --skip-rrna --skip-ncrna --skip-ncrna-region --skip-crispr --skip-sorf --skip-gap --skip-ori --skip-plot --skip-pseudo -o /tmp/bakta_test
+rm -rf /tmp/test.fasta /tmp/bakta_test
+
+# ==============================================================================
+# GetOrganelle Setup & Database Download
+# ==============================================================================
+
+mamba install -c conda-forge -c bioconda getorganelle
+get_organelle_config.py --config-dir /data/databases/getorganelle_db -a animal_mt,embplant_mt,embplant_pt,fungus_mt,fungus_nr
+echo 'export GETORG_PATH=/data/databases/getorganelle_db' >> ~/.bashrc
+source ~/.bashrc
+
+# ==============================================================================
+# Kraken2 Database Download
+# ==============================================================================
+
+# Go into Kraken2 database directory
+cd /data/databases/kraken2_db
+
+# Option A: The Full Standard Database (~75 GB to download, requires >60 GB RAM to run)
+aria2c \
+  --continue=true \
+  --max-connection-per-server=16 \
+  --split=16 \
+  --min-split-size=1M \
+  --summary-interval=60 \
+  -o k2_standard.tar.gz \
+  "https://genome-idx.s3.amazonaws.com/kraken/k2_standard_20240904.tar.gz"
+
+# Extract the files using parallel pigz for much faster decompression
+# (Ensure pigz is installed: sudo apt install pigz)
+tar --use-compress-program="pigz -p 64" -xvf k2_standard.tar.gz
+# (Or whatever you named the output file)
+
+echo 'export KRAKEN2_DB_PATH="/data/databases/kraken2_db"' >> ~/.bashrc
+source ~/.bashrc
+
+# ==============================================================================
+# Plassembler Database Download
+# ==============================================================================
+
+# Just run the native script
+plassembler download -d /data/databases/plassembler_db
+
+echo 'export plassembler_db="/data/databases/plassembler_db"' >> ~/.bashrc
+source ~/.bashrc
