@@ -1,0 +1,133 @@
+NanoPlot -t 128 --fastq example.fastq.gz -c green -o example_NanoPlot --loglength --plots dot --N50
+
+barrnap --threads 16 --incseq --outseq EG64-barrnap.fasta polished_EG64/EG64-consensus.fasta > EG64-features.gff
+
+barrnap --threads 48 --outseq miniasm-bioslurry-barrnap.fasta miniasm-bioslurry.fasta
+
+filtlong --min_length 400 --keep_percent 90 merged_2DL.fastq.gz | pigz filt_2DL.fastq.gz
+flye --nano-hq filt_2DL.fastq.gz -o 2DL_flye -t 128 -i 1 --meta
+flye --nano-raw final-Ci.fastq.gz -o Ci-flye4 -t 36 -i 2 --asm-coverage 40 --genome-size 3m
+
+pigz -dc final-BK71A.fastq.gz | chopper -q 10 -l 500 -t 128 | pigz > filt1-BK71A.fastq.gz
+
+raven -t 128 -u 1500 -F T_raven.gfa filt-T.fastq.gz > T_raven.fasta
+
+minimap2 -x ava-ont -t 128 input.fastq.gz input.fastq.gz | pigz > input_overlaps.paf.gz
+
+1) dorado aligner {draft.fasta} rawreads.fastq.gz -o aligned_input -t 128
+
+2) samtools sort -@ 128 aligned_input/*.bam -o aligned_input/aligned_sorted.bam
+samtools addreplacerg -r "@RG\tID:1\tDS:basecall_model=dna_r10.4.1_e8.2_400bps_sup@v5.0.0" aligned_input/aligned_sorted.bam -o aligned_input/aligned_rg.bam
+samtools index aligned_input/aligned_rg.bam
+dorado polish aligned_rg.bam BK71A-assembly.fasta --bacteria --gvcf --threads 128 --ignore-read-groups -o polished_BK71A
+
+# Header only, always clean — equivalent to what you were doing manually, minus the garbage
+samtools view -H aligned_rg.bam
+
+# First few alignment records, properly decoded to tab-delimited SAM text
+samtools view aligned_rg.bam | head -3
+
+# Confirm the RG tag is actually propagated to every read, not just declared in the header
+samtools view aligned_rg.bam | awk '{for(i=12;i<=NF;i++) if ($i ~ /^RG:Z:/) print $i}' | sort | uniq -c
+
+# Double-check no move-table tags snuck in (should return nothing, confirming the "no move tables" log line)
+samtools view aligned_sorted.bam | head -1 | grep -o "mv:B:c" 
+
+# Basic integrity check — catches truncation without reading the whole file
+samtools quickcheck -v aligned_rg.bam && echo "BAM OK"
+
+# Quick mean depth sanity check — useful context for judging how much signal the polisher actually had to work with
+samtools depth -a aligned_rg.bam | awk '{sum+=$3; n++} END {print "Mean depth:", sum/n}'
+
+dnaapler all -i polished_EG64/EG64-consensus.fasta -o EG64-dnaapler -t 48 -a nearest
+
+# First generate overlaps - also needs permissive settings
+minimap2 -x ava-ont -t 136 filt-T.fastq.gz filt-T.fastq.gz | pigz > T-overlaps.paf.gz
+
+# Then miniasm with relaxed parameters
+miniasm -s 300 -o 300 -c 1 -m 50 -e 2 -f filt-T.fastq.gz T_overlaps.paf > T_miniasm.gfa
+
+minipolish -t 128 --rounds 2 --minimap2-preset map-ont --skip_initial filt-T.fastq.gz T_rawminiasm.gfa > T_miniasm.gfa
+
+minimap2 -x ava-ont -t 128 -k19 -w7 -e0 -m100 filt2-2DL.fastq.gz filt2-2DL.fastq.gz | pigz > 2DL-overlaps.paf.gz
+
+# Convert miniasm .gfa to .fasta
+awk -F'\t' '$1=="S"{print ">"$2; print $3}' T_miniasm.gfa > T_miniasm.fasta
+
+awk -F'\t' '$1=="S" {header = ">"$2; depth = ""; if ($2 ~ /c$/) header = header " circular=true"; for(i=4; i<=NF; i++) {if ($i ~ /^dp:f:/ || $i ~ /^rd:i:/) depth = substr($i, 6)}; if (depth != "") header = header " depth=" depth; print header "\n" $3}' 2DL-miniasm.gfa > 2DL-miniasm_enriched.fasta
+
+myloasm -o T-myloasm -t 128 --clean-dir --nano-r10 --min-ol 300 --dereplication-ani 95 target-filt-T.fastq.gz
+
+hifiasm -o T-hifiasm -t 128 --ont -r 2 --rl-cut 300 --sc-cut 9 target-filt-T.fastq.gz
+hifiasm -o 2DL-hifiasm -t 130 --ont -l 0 -f 0  
+
+autocycler compress -i autocycler-assemblies -a autocycler-out --max_contigs 75 -t 100
+
+seqkit stats -a -N 25,50,75,90,95,99 T-flye.fasta T-hifiasm.fasta T-miniasm.fasta T-myloasm.fasta T-raven.fasta > T-assemblies-seqkit-summary.txt
+
+seqkit seq -m 300 -Q 10 -j 64 final-Ci.fastq.gz -o filt1-Ci.fastq.gz
+seqkit seq -m 300 -Q 10 -j 64 final-Ci.fastq.gz | pigz -p 32 > filt1-Ci.fastq.gz
+
+autocycler helper -o Ci-canu2/Ci-canu -g 2.9m -t 128 -d Ci-canu2 --read_type ont_r10 -r filt1-Ci.fastq.gz canu
+
+bakta --db $BAKTA_DB --output EG64-bakta --prefix EG64 --genus Bacillus --species paranthracis --gram + --complete --compliant --threads 140 final-EG64/EG64-final.fasta
+
+# 1. GC per contig — one command, immediately tells you if the two
+#    circular loops (and the fragment pool) cluster differently
+seqkit fx2tab -n -g -l T-myloasm3.fasta
+
+# 2. Does the fragment pool actually tile the trusted miniasm assembly?
+minimap2 -x asm10 -c T-myloasm3.fasta miniasm_assembly.fasta > vs_miniasm.paf
+# check: do the 51 fragments cover ~all of miniasm's 2.78 Mb with little
+# overlap? Do the two circular contigs align to miniasm at all, or not?
+
+# 3. CheckM2 on the whole primary set — duplicated single-copy markers
+#    is the actual smoking gun for two-organism admixture
+checkm2 predict -i T-myloasm2/T-myloasm2.fasta -o checkm2-T-myloasm2 --allmodels -x fasta -t 100 --remove_intermediates --ttable 11
+
+# index the assembly if not done already
+samtools faidx asm.fa
+seqkit fx2tab -n -l asm.fa > asm.contigs.tsv   # name + length
+
+# pull out the three low-coverage contigs into their own files
+for c in u17350 u5269 u12549; do
+  samtools faidx asm.fa ${c} > ${c}.fa
+done
+
+seqkit grep -r -f <(sed 's/^/^/' suspect-contigs.txt) T-myloasm2/T-myloasm2-ref.fasta > T-strain2-candidate.fasta
+
+seqkit grep -v -r -f <(sed 's/^/^/' suspect-contigs.txt) T-myloasm2/T-myloasm2-ref.fasta > T-myloasm2-curated.fasta
+
+metaMDBG asm --out-dir 2DL-metamdbg --in-ont filt2-2DL.fastq.gz 
+
+autocycler cluster -a autocycler-out --max_contigs 200
+
+cd /data/HIL_AA_NMZ_ABE_HAD_24052026/2DL/cat-2DL/autocycler-assemblies
+mkdir -p ../self_paf ../dedup_assemblies
+
+for f in *.fasta *.fa; do
+    echo "Processing $f..."
+    # Self-align using minimap2 retain-all-chains mode
+    minimap2 -x asm5 -DP -t 16 "$f" "$f" > ../self_paf/"${f%.*}.paf" 2>/dev/null
+    
+    # Deduplicate contained contigs and filter <500bp noise
+    python3 dedup_contained.py "$f" ../self_paf/"${f%.*}.paf" \
+        --min-cov 0.90 --min-identity 0.90 --min-len 500 > ../dedup_assemblies/"$f"
+done
+
+# Check summary stats of the clean assemblies
+cd ../dedup_assemblies
+seqkit stats -a *.fasta *.fa -T > 2DL-dedup-assemblies-stats.tsv
+
+echo -e "top1_len\ttop2_len\ttop3_len\ttop4_len\ttop5_len\ttop6_len\ttop7_len\ttop8_len\ttop9_len\ttop10_len" > top10_cols.tsv && for f in *.fasta *.fa; do [ -e "$f" ] || continue; seqkit fx2tab -l -n -i "$f" | awk '{print $2}' | sort -nr | head -n 10 | awk '{a[NR]=$1} END {for(i=1;i<=10;i++) printf "%s%s", (a[i]?a[i]:"-"), (i==10?"\n":"\t")}'; done >> top10_cols.tsv && paste Ci-assemblies-stats.tsv top10_cols.tsv > Ci-assemblies-stats-top10.tsv && rm top10_cols.tsv
+
+
+for f in *.fasta *.fa; do [ -e "$f" ] || continue; echo "Processing $f..."; minimap2 -x asm5 -DP -t 16 "$f" "$f" > self_paf/"${f%.*}.paf" 2>/dev/null && python3 dedup_contained.py "$f" self_paf/"${f%.*}.paf" --min-cov 0.90 --min-identity 0.90 --min-len 10000 > self_paf/dedup_assemblies/"$f"; done
+
+autocycler-assemblies/self_paf/dedup_assemblies
+
+for c in autocycler-out/clustering/qc_pass/cluster_*; do [ -d "$c" ] || continue; autocycler trim -c "$c" && autocycler resolve -c "$c"; done
+
+autocycler combine -a autocycler_out -i autocycler_out/clustering/qc_pass/cluster_*/5_final.gfa
+
+
